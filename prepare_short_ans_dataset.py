@@ -76,13 +76,10 @@ class ShortAnswerDataset(Dataset):
         return len(self.questions)
 
     def __getitem__(self, idx):
-        info = self.short_answer_infos[idx]
-        bio_tagging = self.create_bio_tagging(info[0]['start_token'],
-                                              info[0]['end_token'],
-                                              self.long_answer_infos[idx]['start_token'])
 
-        input_tokens = self.questions[idx].split()  # question in the beginning or end?
-        input_tokens.append(' ' + self.tokenizer.sep_token + ' ')
+        input_tokens = self.questions[idx].split()
+        input_tokens.append(self.tokenizer.sep_token)
+        question_len = len(input_tokens)
         input_tokens.extend(self.long_answers[idx])
         encoding = self.tokenizer(input_tokens,
                                   is_split_into_words=True,
@@ -92,7 +89,25 @@ class ShortAnswerDataset(Dataset):
                                   max_length=self.max_len,
                                   return_tensors='pt')
 
-        return encoding, bio_tagging
+        token_mapping = self.get_tokenization_mapping(encoding['offset_mapping'])
+        info = self.short_answer_infos[idx]
+        bio_tagging = self.create_bio_tagging(info[0]['start_token'] + question_len,
+                                              info[0]['end_token'] + question_len,
+                                              self.long_answer_infos[idx]['start_token'],
+                                              token_mapping)
+
+        return encoding, bio_tagging, self.long_answer_infos[idx]['start_token'], question_len
+
+    def get_tokenization_mapping(self, offset_mapping):
+        d = []
+        for i, pair in enumerate(offset_mapping[0]):
+            if pair[0] == 0 and pair[1] == 0:
+                continue
+            if pair[0] == 0:
+                d.append([i])
+            else:
+                d[-1].append(i)
+        return d
 
     def preprocess_data(self, data, simplify_fn):
         questions, long_answers, long_infos, short_infos = [], [], [], []
@@ -124,9 +139,17 @@ class ShortAnswerDataset(Dataset):
             short_infos.append(short_answer_info)
         return questions, long_answers, long_infos, short_infos
 
-    def create_bio_tagging(self, short_start, short_end, long_start):
+    def create_bio_tagging(self, short_start, short_end, long_start, token_mapping):
+        # these are indices in normal tokenization
         start = short_start - long_start
         end = short_end - long_start
+
+        aligned_tokens_nested = token_mapping[start:end]  # +1 here?
+        aligned_tokens = [item for sublist in aligned_tokens_nested for item in sublist]
+
+        # these are indices in bert tokenization
+        start = aligned_tokens[0]
+        end = aligned_tokens[-1] + 1
 
         tags = torch.tensor([self.labels_to_ids['O']] * self.max_len)
         tags[start] = self.labels_to_ids['B']
