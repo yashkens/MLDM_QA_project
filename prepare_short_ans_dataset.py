@@ -1,6 +1,6 @@
 import re
 import torch
-import random
+from tqdm import tqdm
 from torch.utils.data import Dataset, DataLoader
 
 
@@ -59,23 +59,21 @@ def simplify_nq_example(nq_example):
 
 
 class ShortAnswerDataset(Dataset):
-    def __init__(self, data, simplify_fn, tokenizer, max_len):
+    def __init__(self, data, simplify_fn, tokenizer, max_len, should_simplify):
         self.tokenizer = tokenizer
         self.max_len = max_len
+        self.simplify = should_simplify
+        self.simplify_fn = simplify_fn
+        qs, l_ans, s_infos = self.preprocess_data(data)
 
-        bio_tags = ['B', 'I', 'O']
-        self.labels_to_ids = {k: v for v, k in enumerate(bio_tags)}
-
-        qs, l_ans, l_infos, s_infos = self.preprocess_data(data, simplify_fn)
         self.questions = qs
         self.long_answers = l_ans  # this is a list of lists (tokenized texts)
-        self.long_answer_infos = l_infos
         self.short_answer_infos = s_infos
 
     def __len__(self):
         return len(self.questions)
 
-    def __getitem__(self, idx):
+    def __getitem__(self, idx):  # This is quite slow...
 
         input_tokens = self.questions[idx].split()
         input_tokens.append(self.tokenizer.sep_token)
@@ -88,15 +86,16 @@ class ShortAnswerDataset(Dataset):
                                   truncation=True,
                                   max_length=self.max_len,
                                   return_tensors='pt')
-
         token_mapping = self.get_tokenization_mapping(encoding['offset_mapping'])
-        info = self.short_answer_infos[idx]
-        bio_tagging = self.create_bio_tagging(info[0]['start_token'] + question_len,
-                                              info[0]['end_token'] + question_len,
-                                              self.long_answer_infos[idx]['start_token'],
-                                              token_mapping)
 
-        return encoding, bio_tagging, self.long_answer_infos[idx]['start_token'], question_len
+        info = self.short_answer_infos[idx]
+        if info['start_token'] == -1:
+            bio_tagging = torch.tensor([0] * self.max_len)
+        else:
+            bio_tagging = self.create_bio_tagging(info['start_token'] + question_len,
+                                                  info['end_token'] + question_len,
+                                                  token_mapping)
+        return encoding, bio_tagging, question_len
 
     def get_tokenization_mapping(self, offset_mapping):
         d = []
@@ -106,52 +105,165 @@ class ShortAnswerDataset(Dataset):
             if pair[0] == 0:
                 d.append([i])
             else:
-                d[-1].append(i)
+                if len(d) == 0:
+                    d.append([i])
+                else:
+                    d[-1].append(i)
         return d
 
-    def preprocess_data(self, data, simplify_fn):
-        questions, long_answers, long_infos, short_infos = [], [], [], []
-        for ex in data:
-            simple_ex = simplify_fn(ex)
-            tokens = simple_ex['document_text'].split()
+    def process_example(self, ex):
+        simple_ex = ex
+        if self.simplify:
+            simple_ex = self.simplify_fn(ex)
+        simple_ex['document_text'] = simple_ex['document_text'].replace('\ufeff', ' - ')
+        tokens = simple_ex['document_text'].split()
 
-            long_answer_info = simple_ex['annotations'][0]['long_answer']
-            if long_answer_info['candidate_index'] == -1:
+        long_answer_info = simple_ex['annotations'][0]['long_answer']
+        if long_answer_info['candidate_index'] == -1:
+            return [], [], [], [], []
+
+        long_answer = tokens[long_answer_info['start_token']:long_answer_info['end_token']]
+        short_answer_info = simple_ex['annotations'][0]['short_answers']
+        if not short_answer_info:
+            return [], [], [], [], []
+        else:
+            start = short_answer_info[0]['start_token'] - long_answer_info['start_token']
+            end = short_answer_info[0]['end_token'] - long_answer_info['start_token']
+
+        orig_short_infos, orig_long_infos = [], []
+        texts, start_inds, end_inds = [], [], []
+
+        # these are used only for test
+        orig_short_infos.append({'start_token': short_answer_info[0]['start_token'],
+                                 'end_token': short_answer_info[0]['end_token']})
+        orig_long_infos.append(long_answer_info)
+
+        i = 0
+        max_len = self.max_len - 150
+        while max_len * i < len(long_answer):
+            curr_text = long_answer[max_len * i: max_len * (i + 1)]
+
+            if start == -1:
+                start_inds.append(-1)
+                end_inds.append(-1)
+                texts.append(curr_text)
+                i += 1
                 continue
 
-            long_answer = tokens[long_answer_info['start_token']:long_answer_info['end_token']]
-            short_answer_info = simple_ex['annotations'][0]['short_answers']
-            if not short_answer_info:
+            new_start = start - max_len * i
+            new_end = end - max_len * i
+
+            if max_len * i < start < max_len * (i + 1) and max_len * i < end < max_len * (i + 1):
+                start_inds.append(new_start)
+                end_inds.append(new_end)
+                texts.append(curr_text)
+            elif max_len * i < start < max_len * (i + 1) or max_len * i < end < max_len * (i + 1):
+                i += 1  # если short answer бьется на несколько кусков, пропускаем
+            else:
+                start_inds.append(-1)
+                end_inds.append(-1)
+                texts.append(curr_text)
+
+            i += 1
+
+        if long_answer[max_len * (i + 1):]:
+            new_start = start - max_len * i
+            new_end = end - max_len * i
+
+            texts.append(long_answer[max_len * (i + 1):])
+            start_inds.append(new_start)
+            end_inds.append(new_end)
+
+        questions = [simple_ex['question_text']] * len(texts)
+        short_infos = []
+        for i in range(len(start_inds)):
+            short_infos.append({'start_token': start_inds[i], 'end_token': end_inds[i]})
+        return texts, short_infos, questions, orig_short_infos, orig_long_infos
+
+    def preprocess_data(self, data):
+        questions, long_answers, short_infos = [], [], []
+        for ex in tqdm(data):
+            texts, shorts, qs, _, _ = self.process_example(ex)
+            if not texts:
                 continue
+            long_answers.extend(texts)
+            short_infos.extend(shorts)
+            questions.extend(qs)
 
-            # TODO: make sure short answer is not cut out after Bert tokenizer
-            if len(long_answer) > self.max_len:
-                start = short_answer_info[0]['start_token'] - long_answer_info['start_token']
-                end = short_answer_info[0]['end_token'] - long_answer_info['start_token']
-                left_margin = random.randint(0, min(self.max_len - (end - start), start))
-                right_margin = self.max_len - left_margin - (end - start)
-                long_answer = long_answer[start - left_margin:min(end + right_margin, len(long_answer) - 1)]
-                long_answer_info['start_token'] += start - left_margin
+        return questions, long_answers, short_infos
 
-            questions.append(simple_ex['question_text'])
-            long_answers.append(long_answer)
-            long_infos.append(long_answer_info)
-            short_infos.append(short_answer_info)
-        return questions, long_answers, long_infos, short_infos
 
-    def create_bio_tagging(self, short_start, short_end, long_start, token_mapping):
+    def create_bio_tagging(self, short_start, short_end, token_mapping):
         # these are indices in normal tokenization
-        start = short_start - long_start
-        end = short_end - long_start
+        start = short_start
+        end = short_end + 1
 
-        aligned_tokens_nested = token_mapping[start:end]  # +1 here?
+        aligned_tokens_nested = token_mapping[start:end]
         aligned_tokens = [item for sublist in aligned_tokens_nested for item in sublist]
 
         # these are indices in bert tokenization
-        start = aligned_tokens[0]
-        end = aligned_tokens[-1] + 1
+        if aligned_tokens:
+            start = aligned_tokens[0]
+            end = aligned_tokens[-1]
+        else:
+            # это для случаев, когда ответ не влез из-за очень дробной токенизации
+            # такое случается, если много слов на других языках или странных чисел
+            return torch.tensor([0] * self.max_len)
 
-        tags = torch.tensor([self.labels_to_ids['O']] * self.max_len)
-        tags[start] = self.labels_to_ids['B']
-        tags[start + 1:end] = self.labels_to_ids['I']
+        tags = torch.tensor([0] * self.max_len)
+        tags[start:end] = 1
         return tags
+
+
+class TestShortAnswerDataset(ShortAnswerDataset):
+    def __init__(self, data, simplify_fn, tokenizer, max_len, should_simplify):
+        # TODO: надо переделать классы, чтобы preprocess data не делалось лишний раз
+        # super().__init__(data, simplify_fn, tokenizer, max_len, should_simplify)
+        self.tokenizer = tokenizer
+        self.max_len = max_len
+        self.simplify = should_simplify
+        self.simplify_fn = simplify_fn
+        qs, l_ans, s_infos, orig_s_infos, orig_l_infos = self.preprocess_data(data)
+
+        self.questions = qs
+        self.long_answers = l_ans  # this is a list of lists (tokenized texts)
+        self.short_answer_infos = s_infos
+        self.orig_short_infos = orig_s_infos
+        self.orig_long_infos = orig_l_infos
+
+    def preprocess_data(self, data):
+        questions, long_answers, short_infos = [], [], []
+        orig_short_infos, orig_long_infos = [], []
+        for ex in tqdm(data):
+            texts, shorts, qs, orig_shorts, orig_longs = self.process_example(ex)
+            if not texts:
+                continue
+            long_answers.append(texts)
+            short_infos.append(shorts)
+            questions.append(qs)
+            orig_short_infos.append(orig_shorts)
+            orig_long_infos.append(orig_longs)
+
+        return questions, long_answers, short_infos, orig_short_infos, orig_long_infos
+
+    def __getitem__(self, idx):
+
+        batch_questions = self.questions[idx]
+        batch_long_answers = self.long_answers[idx]
+        encodings, question_len = [], []
+
+        for i in range(len(batch_questions)):
+            input_tokens = batch_questions[i].split()
+            input_tokens.append(self.tokenizer.sep_token)
+            question_len = len(input_tokens)
+            input_tokens.extend(batch_long_answers[i])
+            encoding = self.tokenizer(input_tokens,
+                                      is_split_into_words=True,
+                                      return_offsets_mapping=True,
+                                      padding='max_length',
+                                      truncation=True,
+                                      max_length=self.max_len,
+                                      return_tensors='pt')
+            encodings.append(encoding)
+
+        return encodings, question_len, self.orig_short_infos[idx], self.orig_long_infos[idx]
